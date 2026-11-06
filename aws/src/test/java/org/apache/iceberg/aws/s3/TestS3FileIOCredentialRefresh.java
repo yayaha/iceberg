@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.TestHelpers;
+import org.apache.iceberg.aws.AwsClientProperties;
 import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.io.StorageCredential;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -43,6 +44,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockserver.integration.ClientAndServer;
 import org.mockserver.model.HttpRequest;
 import org.mockserver.model.HttpResponse;
@@ -180,8 +183,10 @@ public class TestS3FileIOCredentialRefresh {
     }
   }
 
-  @Test
-  public void credentialRefreshWithinFiveMinuteWindow() {
+  @ParameterizedTest
+  @ValueSource(
+      strings = {VendedCredentialsProvider.URI, AwsClientProperties.REFRESH_CREDENTIALS_ENDPOINT})
+  public void credentialRefreshWithinFiveMinuteWindow(String endpointProperty) {
     // Set up credentials expiring within the next 5 minutes so the refresh triggers immediately
     String nearExpiryMs = Long.toString(Instant.now().plus(3, ChronoUnit.MINUTES).toEpochMilli());
 
@@ -228,8 +233,8 @@ public class TestS3FileIOCredentialRefresh {
         ImmutableMap.of(
             AwsProperties.CLIENT_FACTORY,
             StaticClientFactory.class.getName(),
-            VendedCredentialsProvider.URI,
-            CREDENTIALS_URI,
+            endpointProperty,
+            endpoint(endpointProperty),
             CatalogProperties.URI,
             CATALOG_URI,
             "init-creation-stacktrace",
@@ -265,6 +270,62 @@ public class TestS3FileIOCredentialRefresh {
                         S3FileIOProperties.SESSION_TOKEN_EXPIRES_AT_MS, refreshedExpiryMs);
               });
     }
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {VendedCredentialsProvider.URI, AwsClientProperties.REFRESH_CREDENTIALS_ENDPOINT})
+  void noScheduledRefreshWhenRefreshIsDisabled(String endpointProperty) {
+    String nearExpiryMs = Long.toString(Instant.now().plus(3, ChronoUnit.MINUTES).toEpochMilli());
+    StorageCredential initialCredential =
+        StorageCredential.create(
+            "s3://bucket/path",
+            ImmutableMap.of(
+                S3FileIOProperties.ACCESS_KEY_ID,
+                "initialAccessKey",
+                S3FileIOProperties.SECRET_ACCESS_KEY,
+                "initialSecretKey",
+                S3FileIOProperties.SESSION_TOKEN,
+                "initialToken",
+                S3FileIOProperties.SESSION_TOKEN_EXPIRES_AT_MS,
+                nearExpiryMs));
+    HttpRequest mockRequest = request("/v1/credentials").withMethod(HttpMethod.GET.name());
+
+    Map<String, String> properties =
+        ImmutableMap.of(
+            AwsProperties.CLIENT_FACTORY,
+            StaticClientFactory.class.getName(),
+            endpointProperty,
+            endpoint(endpointProperty),
+            AwsClientProperties.REFRESH_CREDENTIALS_ENABLED,
+            "false",
+            CatalogProperties.URI,
+            CATALOG_URI,
+            "init-creation-stacktrace",
+            "false");
+
+    StaticClientFactory.client = null;
+    try (S3FileIO fileIO = new S3FileIO()) {
+      fileIO.initialize(properties);
+      fileIO.setCredentials(List.of(initialCredential));
+
+      // near-expiry credentials would schedule an immediate refresh if refresh were enabled
+      fileIO.client();
+
+      Awaitility.await()
+          .during(2, TimeUnit.SECONDS)
+          .atMost(3, TimeUnit.SECONDS)
+          .untilAsserted(() -> mockServer.verify(mockRequest, VerificationTimes.never()));
+      assertThat(fileIO.credentials()).containsExactly(initialCredential);
+    }
+  }
+
+  /**
+   * Returns the endpoint value for the property: an absolute URI for credentials.uri, or a relative
+   * path for client.refresh-credentials-endpoint, as a REST catalog sends it.
+   */
+  private static String endpoint(String endpointProperty) {
+    return endpointProperty.equals(VendedCredentialsProvider.URI) ? CREDENTIALS_URI : "credentials";
   }
 
   @Test

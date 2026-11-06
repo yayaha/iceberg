@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.aws.AwsClientProperties;
 import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.rest.HttpMethod;
@@ -488,6 +489,80 @@ public class TestVendedCredentialsProvider {
 
     // token endpoint is hit once due to the properties not containing the token's expiration
     mockServer.verify(mockRequest, VerificationTimes.once());
+  }
+
+  @Test
+  void relativeRefreshCredentialsEndpoint() {
+    HttpRequest mockRequest = request("/v1/credentials").withMethod(HttpMethod.GET.name());
+    Credential credential = nonExpiredCredential();
+    mockServer
+        .when(mockRequest)
+        .respond(
+            response(
+                    LoadCredentialsResponseParser.toJson(
+                        ImmutableLoadCredentialsResponse.builder()
+                            .addCredentials(credential)
+                            .build()))
+                .withStatusCode(200));
+
+    // a REST catalog sends the endpoint relative to the catalog URI and no credentials.uri
+    Map<String, String> properties =
+        ImmutableMap.of(
+            AwsClientProperties.REFRESH_CREDENTIALS_ENDPOINT,
+            "credentials",
+            CatalogProperties.URI,
+            CATALOG_URI);
+
+    try (VendedCredentialsProvider provider = VendedCredentialsProvider.create(properties)) {
+      verifyCredentials(provider.resolveCredentials(), credential);
+    }
+
+    mockServer.verify(mockRequest, VerificationTimes.once());
+  }
+
+  @Test
+  void credentialsUriTakesPrecedenceOverRefreshCredentialsEndpoint() {
+    HttpRequest mockRequest = request("/v1/credentials").withMethod(HttpMethod.GET.name());
+    HttpRequest otherRequest = request("/v1/other").withMethod(HttpMethod.GET.name());
+    Credential credential = nonExpiredCredential();
+    mockServer
+        .when(mockRequest)
+        .respond(
+            response(
+                    LoadCredentialsResponseParser.toJson(
+                        ImmutableLoadCredentialsResponse.builder()
+                            .addCredentials(credential)
+                            .build()))
+                .withStatusCode(200));
+
+    Map<String, String> properties =
+        ImmutableMap.<String, String>builder()
+            .putAll(PROPERTIES)
+            .put(AwsClientProperties.REFRESH_CREDENTIALS_ENDPOINT, "other")
+            .build();
+
+    try (VendedCredentialsProvider provider = VendedCredentialsProvider.create(properties)) {
+      verifyCredentials(provider.resolveCredentials(), credential);
+    }
+
+    mockServer.verify(mockRequest, VerificationTimes.once());
+    mockServer.verify(otherRequest, VerificationTimes.never());
+  }
+
+  private static Credential nonExpiredCredential() {
+    return ImmutableCredential.builder()
+        .prefix("s3")
+        .config(
+            ImmutableMap.of(
+                S3FileIOProperties.ACCESS_KEY_ID,
+                "randomAccessKey",
+                S3FileIOProperties.SECRET_ACCESS_KEY,
+                "randomSecretAccessKey",
+                S3FileIOProperties.SESSION_TOKEN,
+                "sessionToken",
+                S3FileIOProperties.SESSION_TOKEN_EXPIRES_AT_MS,
+                Long.toString(Instant.now().plus(1, ChronoUnit.HOURS).toEpochMilli())))
+        .build();
   }
 
   @Test
